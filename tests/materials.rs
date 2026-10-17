@@ -477,3 +477,34 @@ fn manifest_uses_pak_first_then_reports_external_and_unresolved_assets() {
         ]
     );
 }
+
+#[test]
+fn reports_unavailable_patch_includes_as_unresolved_when_allowed() {
+    let resources = vec![bsp_to_glb::PakResource {
+        path: "materials/maps/test/glass_0_0_0.vmt".to_owned(),
+        kind: PakResourceKind::Vmt,
+        data: br#"patch { include "materials/glass/window.vmt" insert { "$envmap" "maps/test/c0_0_0" } }"#
+            .to_vec(),
+    }];
+    let names = ["maps/test/glass_0_0_0".to_owned()];
+
+    let error = build_source_material_manifest(&names, &resources, None).unwrap_err();
+    assert!(error.contains("unavailable dependency"), "{error}");
+
+    let manifest = bsp_to_glb::build_source_material_manifest_with_policy(
+        &names,
+        &resources,
+        None,
+        bsp_to_glb::MaterialBuildPolicy {
+            allow_unresolved_patch_includes: true,
+        },
+    )
+    .unwrap();
+    assert!(manifest.materials[0].metadata.is_none());
+    let value = serde_json::to_value(&manifest).unwrap();
+    assert_eq!(value["unresolvedAssets"][0]["role"], "patchInclude");
+    assert_eq!(
+        value["unresolvedAssets"][0]["lookupPath"],
+        "materials/glass/window.vmt"
+    );
+}

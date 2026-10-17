@@ -1,8 +1,9 @@
 use bsp_to_glb::static_physics::{StaticPhysicsLimits, export_bsp_static_physics};
 use bsp_to_glb::{
-    CollisionExportInput, ExportOptions, LightmapSet, MaterialResolver, MountedMaterialResolver,
-    StudioModelInput, VtfImageSelection, build_metadata, encode_lightmap_png,
-    export_bsp_with_material_resolver, export_bsp_with_material_resolver_and_visibility,
+    CollisionExportInput, ExportOptions, LightmapSet, LightmapStylePolicy, MaterialResolver,
+    MountedMaterialResolver, StudioModelInput, VtfImageSelection, build_metadata,
+    encode_lightmap_png, export_bsp_with_material_resolver,
+    export_bsp_with_material_resolver_and_visibility,
     export_bsp_with_options_and_material_resolver,
     export_bsp_with_options_and_material_resolver_and_visibility, export_collision_sidecar,
     export_entity_graph, export_studio_metadata_model, export_studio_model, read_bsp_pak_archive,
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --studio-source-path <models/model.mdl> --studio-mdl <model.mdl> [--studio-vvd <model.vvd> --studio-vtx <model.dx90.vtx>] [--studio-ani <model.ani>] [--studio-phy <model.phy>] [--studio-skin <index>] --studio-out <model.glb> --studio-manifest <model.json>\n       bsp-to-glb --version | --version-json"
+    "Usage: bsp-to-glb --bsp <compiled.bsp> [--out <map.glb>] [--pak-output <directory> --pak-manifest <pak.json>] [--collision-out <map.collision.json>] [--physics-manifest <map.physics.json> --physics-binary <map.physics.bin>] [--entities-out <map.entities.json>] [--decal-overlays-out <map.decal-overlays.json>] [--visibility-out <map.visibility.json>] [--lightmaps <lightmap_data.json> | --lightmap-set <auto|ldr|hdr|none>] [--atlas-width <pixels>] [--lightmap-styles <strict|first|all|N[,N...]>] [--allow-unresolved-patch-includes <true|false>] [--lightmap-atlas <flat.png>] [--lightmap-manifest <lightmaps.json>] [--material-mount-plan <mounts.json>] [--material-manifest <materials.json>] [--texture-output <directory> [--texture-manifest <textures.json>] [--texture-mip <level>] [--texture-frame <index>] [--texture-face <index>] [--texture-slice <index>]] [--props-out <props.json>]\n       bsp-to-glb --studio-source-path <models/model.mdl> --studio-mdl <model.mdl> [--studio-vvd <model.vvd> --studio-vtx <model.dx90.vtx>] [--studio-ani <model.ani>] [--studio-phy <model.phy>] [--studio-skin <index>] --studio-out <model.glb> --studio-manifest <model.json>\n       bsp-to-glb --version | --version-json"
 }
 
 fn create_parent(path: &Path) -> Result<(), String> {
@@ -301,6 +302,39 @@ fn run() -> Result<(), String> {
                     .map_err(|_| format!("invalid atlas width: {}", value.to_string_lossy()))?;
             }
             "--visibility-out" => visibility_path = Some(value.into()),
+            "--lightmap-styles" => {
+                options.lightmap_styles = match value.to_string_lossy().as_ref() {
+                    "strict" => LightmapStylePolicy::Strict,
+                    "first" => LightmapStylePolicy::First,
+                    "all" => LightmapStylePolicy::All,
+                    list => {
+                        let styles = list
+                            .split(',')
+                            .filter(|item| !item.is_empty())
+                            .map(|item| {
+                                item.trim().parse::<u8>().map_err(|_| {
+                                    format!("invalid light style {item:?} in --lightmap-styles")
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        LightmapStylePolicy::enabled_styles(&styles)
+                    }
+                };
+            }
+            "--allow-unresolved-patch-includes" => {
+                options.material_policy.allow_unresolved_patch_includes = match value
+                    .to_string_lossy()
+                    .as_ref()
+                {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "--allow-unresolved-patch-includes expects true or false, got {other}"
+                        ));
+                    }
+                };
+            }
             _ => return Err(format!("unknown argument: {flag}\n{}", usage())),
         }
         index += 2;

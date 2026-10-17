@@ -1737,7 +1737,8 @@ fn exports_a_local_displacement_map() {
 fn no_displacement_export_remains_byte_and_metric_stable() {
     let result = export_bsp(&synthetic_bsp(false), None).unwrap();
 
-    assert_eq!(fnv1a64(&result.glb), 16_361_024_428_849_545_199);
+    // Golden hash includes the per-material `sourceReflectivity` extra.
+    assert_eq!(fnv1a64(&result.glb), 16_315_478_812_346_526_558);
     assert_eq!(result.stats.faces, 2);
     assert_eq!(result.stats.vertices, 8);
     assert_eq!(result.stats.triangles, 4);

@@ -1,4 +1,6 @@
-use bsp_to_glb::{ExportOptions, LightmapSet, encode_lightmap_png, export_bsp_with_options};
+use bsp_to_glb::{
+    ExportOptions, LightmapSet, LightmapStylePolicy, encode_lightmap_png, export_bsp_with_options,
+};
 use serde_json::Value;
 use std::fs;
 use std::process::Command;
@@ -548,4 +550,90 @@ fn cli_writes_flat_directional_atlases_and_versioned_manifest() {
     );
 
     fs::remove_dir_all(directory).unwrap();
+}
+
+fn decode(sample: &[u8]) -> [f32; 3] {
+    let scale = 2_f32.powi(i32::from(sample[3] as i8)) / 255.0;
+    [
+        f32::from(sample[0]) * scale,
+        f32::from(sample[1]) * scale,
+        f32::from(sample[2]) * scale,
+    ]
+}
+
+fn assert_close(actual: [f32; 3], expected: [f32; 3]) {
+    for axis in 0..3 {
+        let tolerance = expected[axis].abs() * 0.01 + 1e-4;
+        assert!(
+            (actual[axis] - expected[axis]).abs() <= tolerance,
+            "{actual:?} != {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn composes_multi_style_faces_when_a_style_policy_is_selected() {
+    let bsp = synthetic_bsp(
+        Some(lighting(10, true, 2)),
+        None,
+        true,
+        [0, 32, 255, 255],
+        0,
+        0,
+    );
+    let export = |policy| {
+        export_bsp_with_options(
+            &bsp,
+            &ExportOptions {
+                lightmap_set: LightmapSet::Ldr,
+                lightmap_styles: policy,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap()
+    };
+
+    let first = export(LightmapStylePolicy::First);
+    let artifacts = first.lightmaps.as_ref().unwrap();
+    assert_eq!(&artifacts.flat.pixels[0..4], &sample(10, 2, 3, -1));
+    let manifest = serde_json::to_value(&artifacts.manifest).unwrap();
+    assert_eq!(manifest["faces"][0]["styles"], serde_json::json!([0, 32]));
+    assert!(manifest["faces"][0].get("composedStyles").is_none());
+    assert_eq!(manifest["styles"]["composition"], "first-style");
+
+    let all = export(LightmapStylePolicy::All);
+    let artifacts = all.lightmaps.as_ref().unwrap();
+    let style0 = decode(&sample(10, 2, 3, -1));
+    let style32 = decode(&sample(50, 2, 3, -1));
+    assert_close(
+        decode(&artifacts.flat.pixels[0..4]),
+        [
+            style0[0] + style32[0],
+            style0[1] + style32[1],
+            style0[2] + style32[2],
+        ],
+    );
+    let bump0 = decode(&sample(20, 2, 3, -1));
+    let bump32 = decode(&sample(60, 2, 3, -1));
+    assert_close(
+        decode(&artifacts.directional[0].pixels[0..4]),
+        [
+            bump0[0] + bump32[0],
+            bump0[1] + bump32[1],
+            bump0[2] + bump32[2],
+        ],
+    );
+    let manifest = serde_json::to_value(&artifacts.manifest).unwrap();
+    assert_eq!(
+        manifest["faces"][0]["composedStyles"],
+        serde_json::json!([0, 32])
+    );
+
+    let only_switchable = export(LightmapStylePolicy::enabled_styles(&[32]));
+    let artifacts = only_switchable.lightmaps.as_ref().unwrap();
+    assert_close(decode(&artifacts.flat.pixels[0..4]), style32);
+
+    let dark = export(LightmapStylePolicy::enabled_styles(&[1]));
+    let artifacts = dark.lightmaps.as_ref().unwrap();
+    assert_eq!(&artifacts.flat.pixels[0..4], &[0, 0, 0, 0]);
 }

@@ -982,13 +982,25 @@ struct ResolvedVmt {
     dependencies: Vec<ManifestResource>,
 }
 
+/// Outcome of resolving a VMT whose Patch chain may reference unavailable files.
+enum VmtResolution {
+    Resolved(Box<ResolvedVmt>),
+    /// A Patch include could not be found and the caller allowed this; the
+    /// material is reported as unresolved instead of failing the export.
+    MissingPatchInclude {
+        include_path: String,
+        dependencies: Vec<ManifestResource>,
+    },
+}
+
 fn resolve_effective_vmt(
     root_data: &[u8],
     root_path: &str,
     embedded_resources: &[PakResource],
     by_path: &HashMap<String, usize>,
     resolver: Option<&dyn MaterialResolver>,
-) -> Result<ResolvedVmt, String> {
+    allow_unresolved_patch_includes: bool,
+) -> Result<VmtResolution, String> {
     let mut document = parse_vmt_document(root_data)
         .map_err(|error| format!("failed to parse {root_path}: {error}"))?;
     let mut current_path = root_path.to_owned();
@@ -1025,6 +1037,11 @@ fn resolve_effective_vmt(
                     Cow::Owned(resource.data),
                     external_provenance(resource.provenance),
                 )
+            } else if allow_unresolved_patch_includes {
+                return Ok(VmtResolution::MissingPatchInclude {
+                    include_path,
+                    dependencies,
+                });
             } else {
                 return Err(format!(
                     "Patch VMT {current_path} includes unavailable dependency {include_path}"
@@ -1042,10 +1059,10 @@ fn resolve_effective_vmt(
 
     apply_patch_entries(&mut document.values, &changes.insert, false, 1)?;
     apply_patch_entries(&mut document.values, &changes.replace, true, 1)?;
-    Ok(ResolvedVmt {
+    Ok(VmtResolution::Resolved(Box::new(ResolvedVmt {
         material: material_from_document(document)?,
         dependencies,
-    })
+    })))
 }
 
 struct TexturePackageBuilder {
@@ -1565,11 +1582,22 @@ fn material_texture_references(material: &VmtMaterial) -> Vec<(&TextureInputSpec
         .collect()
 }
 
+/// Policy knobs for material manifest construction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaterialBuildPolicy {
+    /// Report a Patch VMT whose include target is unavailable as an unresolved
+    /// material (role `patchInclude`) instead of failing the whole export. This
+    /// is needed for asset-less conversion, where VBSP cubemap patch materials
+    /// reference stock VMTs that are not mounted.
+    pub allow_unresolved_patch_includes: bool,
+}
+
 fn build_materials(
     material_names: &[String],
     embedded_resources: &[PakResource],
     resolver: Option<&dyn MaterialResolver>,
     texture_selection: Option<VtfImageSelection>,
+    policy: MaterialBuildPolicy,
 ) -> Result<MaterialBuild, String> {
     let mut by_path = HashMap::new();
     for (index, resource) in embedded_resources.iter().enumerate() {
@@ -1616,15 +1644,39 @@ fn build_materials(
             });
             (None, ResourceProvenance::Unresolved)
         };
-        let resolved_vmt = vmt_data
+        let resolution = vmt_data
             .as_deref()
             .map(|data| {
-                resolve_effective_vmt(data, &vmt_path, embedded_resources, &by_path, resolver)
+                resolve_effective_vmt(
+                    data,
+                    &vmt_path,
+                    embedded_resources,
+                    &by_path,
+                    resolver,
+                    policy.allow_unresolved_patch_includes,
+                )
             })
             .transpose()?;
+        let (resolved_vmt, unresolved_dependencies) = match resolution {
+            Some(VmtResolution::Resolved(resolved)) => (Some(*resolved), None),
+            Some(VmtResolution::MissingPatchInclude {
+                include_path,
+                dependencies,
+            }) => {
+                unresolved_assets.push(UnresolvedAsset {
+                    kind: PakResourceKind::Vmt,
+                    lookup_path: include_path,
+                    referenced_by: name.clone(),
+                    role: "patchInclude".to_owned(),
+                });
+                (None, Some(dependencies))
+            }
+            None => (None, None),
+        };
         let dependencies = resolved_vmt
             .as_ref()
             .map(|resolved| resolved.dependencies.clone())
+            .or(unresolved_dependencies)
             .unwrap_or_default();
         let metadata = resolved_vmt.map(|resolved| resolved.material);
         let mut textures = Vec::new();
@@ -1757,7 +1809,21 @@ pub fn build_source_material_manifest(
     embedded_resources: &[PakResource],
     resolver: Option<&dyn MaterialResolver>,
 ) -> Result<SourceMaterialManifest, String> {
-    Ok(build_materials(material_names, embedded_resources, resolver, None)?.manifest)
+    build_source_material_manifest_with_policy(
+        material_names,
+        embedded_resources,
+        resolver,
+        MaterialBuildPolicy::default(),
+    )
+}
+
+pub fn build_source_material_manifest_with_policy(
+    material_names: &[String],
+    embedded_resources: &[PakResource],
+    resolver: Option<&dyn MaterialResolver>,
+    policy: MaterialBuildPolicy,
+) -> Result<SourceMaterialManifest, String> {
+    Ok(build_materials(material_names, embedded_resources, resolver, None, policy)?.manifest)
 }
 
 pub fn build_source_material_package(
@@ -1766,11 +1832,28 @@ pub fn build_source_material_package(
     resolver: Option<&dyn MaterialResolver>,
     selection: VtfImageSelection,
 ) -> Result<SourceMaterialPackage, String> {
+    build_source_material_package_with_policy(
+        material_names,
+        embedded_resources,
+        resolver,
+        selection,
+        MaterialBuildPolicy::default(),
+    )
+}
+
+pub fn build_source_material_package_with_policy(
+    material_names: &[String],
+    embedded_resources: &[PakResource],
+    resolver: Option<&dyn MaterialResolver>,
+    selection: VtfImageSelection,
+    policy: MaterialBuildPolicy,
+) -> Result<SourceMaterialPackage, String> {
     let built = build_materials(
         material_names,
         embedded_resources,
         resolver,
         Some(selection),
+        policy,
     )?;
     let (manifest, artifacts) = built
         .texture_package

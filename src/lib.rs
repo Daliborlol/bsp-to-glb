@@ -36,6 +36,7 @@ pub use entities::{
 pub use material_resolver::{
     MATERIAL_MOUNT_PLAN_VERSION, MaterialResolverLimits, MountedMaterialResolver,
 };
+pub use materials::MaterialBuildPolicy;
 pub use materials::{
     BuiltInTextureBinding, EmbeddedResourceMetadata, MATERIAL_MANIFEST_VERSION,
     MATERIAL_TEXTURE_MANIFEST_VERSION, ManifestResource, ManifestTexture, MaterialLimitations,
@@ -45,7 +46,8 @@ pub use materials::{
     SourceMaterialManifest, SourceMaterialPackage, TextureDecodeStatus, TextureSemantic,
     UnresolvedAsset, UnsupportedMaterialFeatures, VmtFeatures, VmtMaterial, VmtProxyDefinition,
     VmtProxyParameter, VmtShaderMetadata, VmtTextureInputs, build_source_material_manifest,
-    build_source_material_package, parse_vmt, read_bsp_pak_resources,
+    build_source_material_manifest_with_policy, build_source_material_package,
+    build_source_material_package_with_policy, parse_vmt, read_bsp_pak_resources,
 };
 pub use studiomodel::{
     STUDIO_MODEL_MDL_VERSIONS, STUDIO_MODEL_PACKAGE_VERSION, StudioModelExport, StudioModelInput,
@@ -256,11 +258,51 @@ pub enum LightmapSet {
     None,
 }
 
+/// How faces that store more than one light style are exported.
+///
+/// Source stores one lightmap per style (style 0 is static light, 1-31 are
+/// animated presets and 32+ are switchable named lights). The default keeps
+/// the historical fail-closed behavior; the other policies compose a single
+/// flat/directional lightmap per face by summing decoded linear samples.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LightmapStylePolicy {
+    /// Abort export when a face stores more than one style.
+    #[default]
+    Strict,
+    /// Keep only the first stored style of every face.
+    First,
+    /// Sum every stored style (all switchable lights on).
+    All,
+    /// Sum only styles whose bit is set (bit `n` of word `n / 64`); other
+    /// styles contribute nothing, so a face lit only by disabled styles is black.
+    Enabled([u64; 4]),
+}
+
+impl LightmapStylePolicy {
+    pub fn enabled_styles(styles: &[u8]) -> Self {
+        let mut words = [0_u64; 4];
+        for style in styles {
+            words[usize::from(*style) / 64] |= 1 << (style % 64);
+        }
+        Self::Enabled(words)
+    }
+
+    fn includes(&self, position: usize, style: u8) -> bool {
+        match self {
+            Self::Strict | Self::All => true,
+            Self::First => position == 0,
+            Self::Enabled(words) => words[usize::from(style) / 64] & (1 << (style % 64)) != 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExportOptions {
     pub lightmap_set: LightmapSet,
     pub atlas_width: u32,
     pub material_texture_selection: Option<VtfImageSelection>,
+    pub lightmap_styles: LightmapStylePolicy,
+    pub material_policy: MaterialBuildPolicy,
 }
 
 impl Default for ExportOptions {
@@ -269,6 +311,8 @@ impl Default for ExportOptions {
             lightmap_set: LightmapSet::Auto,
             atlas_width: DEFAULT_ATLAS_WIDTH,
             material_texture_selection: None,
+            lightmap_styles: LightmapStylePolicy::Strict,
+            material_policy: MaterialBuildPolicy::default(),
         }
     }
 }
@@ -308,6 +352,7 @@ pub struct ExportStats {
     pub unresolved_prop_models: usize,
     pub displacement_vertices: usize,
     pub displacement_triangles: usize,
+    pub sanitized_displacement_alphas: usize,
     pub capabilities: CapabilityReport,
 }
 
@@ -433,6 +478,8 @@ struct LightmapManifestFace {
     lightmap_mins: [i32; 2],
     lightmap_size: [i32; 2],
     styles: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    composed_styles: Option<Vec<u8>>,
     bump_light: bool,
 }
 
@@ -676,6 +723,7 @@ struct TexInfo {
 
 #[derive(Clone, Copy)]
 struct TexData {
+    reflectivity: [f32; 3],
     name_index: i32,
     width: i32,
     height: i32,
@@ -730,6 +778,7 @@ struct DisplacementGeometry {
     normals: Vec<[f32; 3]>,
     triangles: Vec<[usize; 3]>,
     alphas: Vec<f32>,
+    non_finite_alphas: usize,
     triangle_tags: Vec<u16>,
     source_triangle_tags: Vec<u16>,
     dispinfo_index: usize,
@@ -1097,6 +1146,7 @@ fn parse_texdata(data: &[u8]) -> Result<Vec<TexData>, String> {
         .map(|index| {
             let offset = index * TEXDATA_SIZE;
             Ok(TexData {
+                reflectivity: read_vec3(data, offset, "texdata reflectivity")?,
                 name_index: read_i32(data, offset + 12, "texdata")?,
                 width: read_i32(data, offset + 16, "texdata")?,
                 height: read_i32(data, offset + 20, "texdata")?,
@@ -2628,7 +2678,11 @@ fn select_lightmap_lumps(
     Ok(selected)
 }
 
-fn face_styles(face: Face, face_index: usize) -> Result<Vec<u8>, String> {
+fn face_styles(
+    face: Face,
+    face_index: usize,
+    policy: LightmapStylePolicy,
+) -> Result<Vec<u8>, String> {
     let first_unused = face
         .styles
         .iter()
@@ -2643,7 +2697,7 @@ fn face_styles(face: Face, face_index: usize) -> Result<Vec<u8>, String> {
         ));
     }
     let styles = face.styles[..first_unused].to_vec();
-    if styles.len() > 1 {
+    if styles.len() > 1 && policy == LightmapStylePolicy::Strict {
         return Err(format!(
             "face {face_index} uses multiple light styles {:?}; style composition is unsupported",
             styles
@@ -2659,6 +2713,7 @@ fn extract_lightmaps(
     texinfos: &[TexInfo],
     face_owner: &[Option<usize>],
     atlas_max_width: u32,
+    style_policy: LightmapStylePolicy,
 ) -> Result<Option<ExtractedLightmaps>, String> {
     let Some(lighting_lump) = selected.lighting else {
         return Ok(None);
@@ -2700,7 +2755,7 @@ fn extract_lightmaps(
                 face.lightmap_size
             ));
         }
-        let styles = face_styles(face, face_index)?;
+        let styles = face_styles(face, face_index, style_policy)?;
         if styles.is_empty() {
             continue;
         }
@@ -2787,7 +2842,46 @@ fn extract_lightmaps(
     let mut manifest_faces = Vec::with_capacity(candidates.len());
 
     for candidate in candidates {
+        let selected_styles: Vec<usize> = candidate
+            .styles
+            .iter()
+            .enumerate()
+            .filter(|(position, style)| style_policy.includes(*position, **style))
+            .map(|(position, _)| position)
+            .collect();
+        let style_stride = candidate.sample_bytes * if candidate.bump_light { 4 } else { 1 };
+        let passthrough = selected_styles == [0];
+        let compose_channel = |channel_offset: usize, destination: &mut [u8]| {
+            let width = candidate.placement.width as usize;
+            for row in 0..candidate.placement.height as usize {
+                for column in 0..width {
+                    let texel = (row * width + column) * 4;
+                    let mut sum = [0.0_f32; 3];
+                    for position in &selected_styles {
+                        let start = candidate.source_start
+                            + position * style_stride
+                            + channel_offset
+                            + texel;
+                        let sample = decode_color_rgb_exp32(&light_data[start..start + 4]);
+                        for axis in 0..3 {
+                            sum[axis] += sample[axis];
+                        }
+                    }
+                    let destination_start = ((candidate.placement.y as usize + row)
+                        * used_width as usize
+                        + candidate.placement.x as usize
+                        + column)
+                        * 4;
+                    destination[destination_start..destination_start + 4]
+                        .copy_from_slice(&encode_color_rgb_exp32(sum));
+                }
+            }
+        };
         let copy_channel = |source_offset: usize, destination: &mut [u8]| {
+            if !passthrough {
+                compose_channel(source_offset - candidate.source_start, destination);
+                return;
+            }
             for row in 0..candidate.placement.height as usize {
                 let row_bytes = candidate.placement.width as usize * 4;
                 let source_start = source_offset + row * row_bytes;
@@ -2818,6 +2912,12 @@ fn extract_lightmaps(
             light_offset: candidate.face.light_offset,
             lightmap_mins: candidate.face.lightmap_mins,
             lightmap_size: candidate.face.lightmap_size,
+            composed_styles: (!passthrough).then(|| {
+                selected_styles
+                    .iter()
+                    .map(|position| candidate.styles[*position])
+                    .collect()
+            }),
             styles: candidate.styles,
             bump_light: candidate.bump_light,
         });
@@ -2862,15 +2962,51 @@ fn extract_lightmaps(
                     .collect(),
             },
             styles: LightmapManifestStyles {
-                supported_per_face: 1,
+                supported_per_face: if style_policy == LightmapStylePolicy::Strict {
+                    1
+                } else {
+                    4
+                },
                 unused_value: 255,
-                composition: "single-style",
+                composition: match style_policy {
+                    LightmapStylePolicy::Strict => "single-style",
+                    LightmapStylePolicy::First => "first-style",
+                    LightmapStylePolicy::All => "sum-all-styles",
+                    LightmapStylePolicy::Enabled(_) => "sum-enabled-styles",
+                },
                 storage_order: "style-major-then-flat-and-directional",
             },
             faces: manifest_faces,
         },
     };
     Ok(Some(ExtractedLightmaps { artifacts, by_face }))
+}
+
+/// Decodes a Source `ColorRGBExp32` sample to linear RGB.
+fn decode_color_rgb_exp32(sample: &[u8]) -> [f32; 3] {
+    let scale = 2_f32.powi(i32::from(sample[3] as i8)) / 255.0;
+    [
+        f32::from(sample[0]) * scale,
+        f32::from(sample[1]) * scale,
+        f32::from(sample[2]) * scale,
+    ]
+}
+
+/// Encodes linear RGB as a Source `ColorRGBExp32` sample.
+fn encode_color_rgb_exp32(color: [f32; 3]) -> [u8; 4] {
+    let max = color[0].max(color[1]).max(color[2]);
+    if !max.is_finite() || max <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let exponent = (max.log2().floor() as i32 + 1).clamp(-128, 127);
+    let scale = 255.0 / 2_f32.powi(exponent);
+    let channel = |value: f32| (value.max(0.0) * scale).round().clamp(0.0, 255.0) as u8;
+    [
+        channel(color[0]),
+        channel(color[1]),
+        channel(color[2]),
+        exponent as i8 as u8,
+    ]
 }
 
 fn lightmap_uv(
@@ -3332,16 +3468,18 @@ fn build_displacement_geometry(
         .zip(source_vertices)
         .map(|(flat, vertex)| add(*flat, scale(vertex.vector, vertex.distance)))
         .collect();
-    if positions
-        .iter()
-        .flatten()
-        .chain(source_vertices.iter().map(|vertex| &vertex.alpha))
-        .any(|value| !value.is_finite())
-    {
+    if positions.iter().flatten().any(|value| !value.is_finite()) {
         return Err(format!(
             "DISPINFO {dispinfo_index} generated a non-finite vertex value"
         ));
     }
+    // Blend alpha only drives material blending, never geometry. Some shipped
+    // maps contain NaN alphas (e.g. pl_eruption_b15 DISPINFO 56), which the
+    // engine tolerates; export them as zero and report the count.
+    let non_finite_alphas = source_vertices
+        .iter()
+        .filter(|vertex| !vertex.alpha.is_finite())
+        .count();
 
     let mut all_triangles = Vec::with_capacity(triangle_count);
     push_displacement_triangles(
@@ -3395,7 +3533,17 @@ fn build_displacement_geometry(
         lightmap_coordinates,
         normals,
         triangles,
-        alphas: source_vertices.iter().map(|vertex| vertex.alpha).collect(),
+        alphas: source_vertices
+            .iter()
+            .map(|vertex| {
+                if vertex.alpha.is_finite() {
+                    vertex.alpha
+                } else {
+                    0.0
+                }
+            })
+            .collect(),
+        non_finite_alphas,
         triangle_tags: exported_triangle_tags,
         source_triangle_tags: triangle_tags,
         dispinfo_index,
@@ -3680,18 +3828,24 @@ fn export_bsp_internal(
     let material_textures = options
         .material_texture_selection
         .map(|selection| {
-            build_source_material_package(
+            build_source_material_package_with_policy(
                 &material_names,
                 &embedded_resources,
                 material_resolver,
                 selection,
+                options.material_policy,
             )
         })
         .transpose()?;
     let material_manifest = if let Some(package) = &material_textures {
         package.material_manifest.clone()
     } else {
-        build_source_material_manifest(&material_names, &embedded_resources, material_resolver)?
+        build_source_material_manifest_with_policy(
+            &material_names,
+            &embedded_resources,
+            material_resolver,
+            options.material_policy,
+        )?
     };
     let models = parse_models(&bsp.lumps[LUMP_MODELS])?;
     let static_props = find_static_props(&bsp, data)?;
@@ -3783,6 +3937,7 @@ fn export_bsp_internal(
         &texinfos,
         &face_owner,
         options.atlas_width,
+        options.lightmap_styles,
     )?;
     let mut visibility = include_visibility
         .then(|| build_visibility(&bsp, &planes, &faces, &models, &face_owner))
@@ -3892,6 +4047,7 @@ fn export_bsp_internal(
                 "extras": {
                     "sourceMaterial": name,
                     "sourceMaterialManifestIndex": index,
+                    "sourceReflectivity": texdata.get(index).map(|item| item.reflectivity),
                     "sourceShaderFamily": metadata.map(|item| item.shader.family.as_str()),
                     "sourceAdditive": metadata.is_some_and(|item| item.features.additive),
                     "unsupportedProxies": metadata
@@ -4184,6 +4340,7 @@ fn export_bsp_internal(
                 }
             }
             if let Some(geometry) = &displacement {
+                stats.sanitized_displacement_alphas += geometry.non_finite_alphas;
                 primitive
                     .displacement_alphas
                     .extend_from_slice(&geometry.alphas);
