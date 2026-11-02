@@ -3942,6 +3942,37 @@ fn export_bsp_internal(
     let mut visibility = include_visibility
         .then(|| build_visibility(&bsp, &planes, &faces, &models, &face_owner))
         .transpose()?;
+    // Overlays on displacements clip against the displaced triangles (built here once more; failures skip).
+    let mut displacement_surfaces = HashMap::new();
+    for &face_index in &displacements {
+        let face = faces[face_index];
+        let Ok(base_positions) = face_positions(face, &surfedges, &edges, &vertices, face_index) else {
+            continue;
+        };
+        let Some(plane) = planes.get(face.plane) else {
+            continue;
+        };
+        if let Ok(geometry) = build_displacement_geometry(
+            face,
+            face_index,
+            &base_positions,
+            plane.normal,
+            &dispinfos,
+            &dispverts,
+            &disptris,
+        ) {
+            displacement_surfaces.insert(
+                face_index,
+                decal_overlays::DisplacementSurface {
+                    flat: geometry.flat_positions,
+                    positions: geometry.positions,
+                    normals: geometry.normals,
+                    lightmap_local: geometry.lightmap_coordinates,
+                    triangles: geometry.triangles,
+                },
+            );
+        }
+    }
     let decal_overlays = decal_overlays::build(decal_overlays::BuildInput {
         bsp_version: bsp.version,
         entities: &entities,
@@ -3961,6 +3992,7 @@ fn export_bsp_internal(
         edges: &edges,
         vertices: &vertices,
         lightmaps: direct_lightmaps.as_ref(),
+        displacements: &displacement_surfaces,
     })?;
 
     let mut entity_by_model: HashMap<usize, (usize, &Entity)> = HashMap::new();

@@ -1,10 +1,10 @@
 use super::{
     Entity, ExtractedLightmaps, Face, Plane, SourceMaterialManifest, SourceMaterialPackage,
-    TexInfo, dot, entity_property, face_positions, lightmap_uv,
+    TexInfo, dot, entity_property, face_positions, lightmap_uv, lightmap_uv_from_local,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const DECAL_OVERLAY_SIDECAR_VERSION: u32 = 1;
 const MAX_RECORDS: usize = 16_384;
@@ -284,6 +284,19 @@ pub(crate) struct BuildInput<'a> {
     pub edges: &'a [[u16; 2]],
     pub vertices: &'a [[f32; 3]],
     pub lightmaps: Option<&'a ExtractedLightmaps>,
+    /// Displacement faces by face index: overlays on them are clipped per displacement triangle.
+    pub displacements: &'a HashMap<usize, DisplacementSurface>,
+}
+
+/// The triangles of one displacement face: `flat` lies in the base face plane (the overlay is projected and
+/// clipped there, as the engine does), `positions` and `normals` are the displaced vertices, and
+/// `lightmap_local` the luxel coordinates of each vertex.
+pub(crate) struct DisplacementSurface {
+    pub flat: Vec<[f32; 3]>,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub lightmap_local: Vec<[f32; 2]>,
+    pub triangles: Vec<[usize; 3]>,
 }
 
 fn read_i16(data: &[u8], offset: usize) -> Option<i16> {
@@ -806,7 +819,17 @@ fn clip_polygon(
     if clip.len() < 3 {
         return Vec::new();
     }
-    let orientation = dot(cross(sub(clip[1], clip[0]), sub(clip[2], clip[1])), normal).signum();
+    // The winding from the whole polygon's area: compiled faces often start with collinear vertices
+    // (T-junction fixes), where the first corner alone gives a zero or wrong sign.
+    let mut area = [0.0_f32; 3];
+    for index in 0..clip.len() {
+        area = add(area, cross(clip[index], clip[(index + 1) % clip.len()]));
+    }
+    let signed = dot(area, normal);
+    if signed.abs() < 1e-6 {
+        return Vec::new();
+    }
+    let orientation = signed.signum();
     for edge_index in 0..clip.len() {
         let start = clip[edge_index];
         let end = clip[(edge_index + 1) % clip.len()];
@@ -1037,9 +1060,14 @@ fn overlay_fragments(input: &BuildInput<'_>, source: &OverlaySource) -> Vec<Deca
         let Some(face) = input.faces.get(face_index).copied() else {
             continue;
         };
-        if face.dispinfo >= 0 {
-            continue;
-        }
+        let displacement = if face.dispinfo >= 0 {
+            match input.displacements.get(&face_index) {
+                Some(surface) => Some(surface),
+                None => continue,
+            }
+        } else {
+            None
+        };
         let Some(model_index) = input.face_owner.get(face_index).copied().flatten() else {
             continue;
         };
@@ -1066,6 +1094,14 @@ fn overlay_fragments(input: &BuildInput<'_>, source: &OverlaySource) -> Vec<Deca
                 }
             })
             .collect();
+        if let Some(surface) = displacement {
+            if let Some(item) =
+                displacement_fragment(input, face_index, model_index, face, &projected, plane, surface)
+            {
+                fragments.push(item);
+            }
+            continue;
+        }
         let Ok(face_polygon) = face_positions(
             face,
             input.surfedges,
@@ -1089,6 +1125,101 @@ fn overlay_fragments(input: &BuildInput<'_>, source: &OverlaySource) -> Vec<Deca
         }
     }
     fragments
+}
+
+/// An overlay on a displacement: the projected overlay polygon is clipped against every displacement
+/// triangle in the base face plane, and each clipped vertex moves to the displaced surface by its barycentric
+/// coordinates in that triangle (positions, normals and lightmap coordinates alike).
+fn displacement_fragment(
+    input: &BuildInput<'_>,
+    face_index: usize,
+    model_index: usize,
+    face: Face,
+    projected: &[ClipVertex],
+    plane: Plane,
+    surface: &DisplacementSurface,
+) -> Option<DecalOverlayFragment> {
+    let placement = input
+        .lightmaps
+        .and_then(|extracted| extracted.by_face.get(&face_index).copied().map(|p| (extracted, p)));
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut uvs = Vec::new();
+    let mut lightmap_uvs = Vec::new();
+    let mut indices = Vec::new();
+    for triangle in &surface.triangles {
+        let flat = [
+            surface.flat[triangle[0]],
+            surface.flat[triangle[1]],
+            surface.flat[triangle[2]],
+        ];
+        let area = dot(cross(sub(flat[1], flat[0]), sub(flat[2], flat[0])), plane.normal);
+        if area.abs() < 1e-6 {
+            continue;
+        }
+        let polygon = clip_polygon(projected.to_vec(), &flat, plane.normal);
+        if polygon.len() < 3 {
+            continue;
+        }
+        let base = positions.len() as u32;
+        for vertex in &polygon {
+            // Barycentric coordinates in the flat triangle (signed areas against the plane normal).
+            let p = vertex.position;
+            let w0 = dot(cross(sub(flat[1], p), sub(flat[2], p)), plane.normal) / area;
+            let w1 = dot(cross(sub(flat[2], p), sub(flat[0], p)), plane.normal) / area;
+            let w2 = 1.0 - w0 - w1;
+            let mix3 = |values: &[[f32; 3]]| {
+                add(
+                    add(scale(values[triangle[0]], w0), scale(values[triangle[1]], w1)),
+                    scale(values[triangle[2]], w2),
+                )
+            };
+            positions.push(mix3(&surface.positions));
+            normals.push(normalize(mix3(&surface.normals)).unwrap_or(plane.normal));
+            uvs.push(vertex.uv);
+            let local = [
+                surface.lightmap_local[triangle[0]][0] * w0
+                    + surface.lightmap_local[triangle[1]][0] * w1
+                    + surface.lightmap_local[triangle[2]][0] * w2,
+                surface.lightmap_local[triangle[0]][1] * w0
+                    + surface.lightmap_local[triangle[1]][1] * w1
+                    + surface.lightmap_local[triangle[2]][1] * w2,
+            ];
+            lightmap_uvs.push(
+                placement
+                    .and_then(|(extracted, placement)| {
+                        lightmap_uv_from_local(placement, &extracted.artifacts.flat, face, local, face_index).ok()
+                    })
+                    .unwrap_or([0.0, 0.0]),
+            );
+        }
+        // build_displacement_geometry orients every triangle outward; each fan triangle follows it.
+        let outward = cross(
+            sub(surface.positions[triangle[1]], surface.positions[triangle[0]]),
+            sub(surface.positions[triangle[2]], surface.positions[triangle[0]]),
+        );
+        let at = |k: usize| positions[base as usize + k];
+        for index in 1..polygon.len() - 1 {
+            let facing = dot(cross(sub(at(index), at(0)), sub(at(index + 1), at(0))), outward);
+            if facing.abs() < 1e-8 {
+                continue;
+            }
+            let (b, c) = if facing > 0.0 { (index, index + 1) } else { (index + 1, index) };
+            indices.extend_from_slice(&[base, base + b as u32, base + c as u32]);
+        }
+    }
+    if indices.is_empty() {
+        return None;
+    }
+    Some(DecalOverlayFragment {
+        bsp_model_index: model_index,
+        bsp_face_index: face_index,
+        positions,
+        normals,
+        uvs,
+        lightmap_uvs,
+        indices,
+    })
 }
 
 fn parent_entity_index(input: &BuildInput<'_>, model_index: usize) -> Option<usize> {
@@ -1392,6 +1523,7 @@ mod tests {
         edges: Vec<[u16; 2]>,
         vertices: Vec<[f32; 3]>,
         entities: Vec<Entity>,
+        displacements: HashMap<usize, DisplacementSurface>,
     }
 
     impl GeometryFixture {
@@ -1486,6 +1618,7 @@ mod tests {
                 edges: &self.edges,
                 vertices: &self.vertices,
                 lightmaps: None,
+                displacements: &self.displacements,
             }
         }
     }
