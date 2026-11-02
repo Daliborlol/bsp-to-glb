@@ -177,6 +177,9 @@ fn run_studio_model(args: &[OsString]) -> Result<(), String> {
     manifest.push(b'\n');
     write(&output_path, &exported.glb)?;
     write(&manifest_path, &manifest)?;
+    for warning in &exported.manifest.warnings {
+        eprintln!("warning: {source_path}: {warning}");
+    }
     println!(
         "{}",
         serde_json::json!({
